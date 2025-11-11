@@ -109,7 +109,7 @@ struct ConnectPacket: Packet {
             username: self.username,
             password: self.password,
             properties: self.properties,
-            will: self.will
+            will: nil // Bug：不应该带 will ，会导致无限重连，甚至导致broker出现混乱
         )
     }
     /// write connect packet to bytebuffer
