@@ -53,7 +53,7 @@ open class MQTTClient:@unchecked Sendable{
     private let queue:DispatchQueue
     //--- Keep safely by sharing a same status lock ---
     private let safe = Safely()//status safe lock
-    private var socket:Socket?
+    private let socket:Socket
     private var pinging:Pinging?
     private var retrier:Retrier?//not nil after startRetrier
     private var monitor:Monitor?//not nil after startMonitor
@@ -83,10 +83,13 @@ open class MQTTClient:@unchecked Sendable{
         self.queue = queue
         self.delegateQueue = queue
         self.endpoint = endpoint
+        self.socket = Socket(endpoint: endpoint, config: config)
+        self.socket.delegate = self
     }
     deinit {
-        self.closeSocket()
-        self.pinging?.cancel()
+        retrier?.stop()
+        monitor?.stop()
+        stopPing()
     }
     
     /// Start the auto reconnect mechanism
@@ -126,60 +129,54 @@ open class MQTTClient:@unchecked Sendable{
     }
     private var _status:Status = .closed(){
         didSet{
-            if oldValue != _status {
-                Logger.debug("STATUS: \(oldValue) --> \(_status)")
-                switch _status{
-                case .opened:
-                    starPing()
-                    retrier?.cancel()
-                case .closed(let reason):
-                    stopPing()
-                    closeSocket()
-                    retrier?.cancel()
-                    if let task = self.connTask{
-                        switch reason{
-                        case .mqttError(let error):
-                            task.done(with: error)
-                        case .otherError(let error):
-                            task.done(with: error)
-                        case .networkError(let error):
-                            task.done(with: error)
-                        case .clientClose(let code):
-                            task.done(with: MQTTError.clientClose(code))
-                        case .serverClose(let code):
-                            task.done(with: MQTTError.serverClose(code))
-                        default:
-                            task.done(with:MQTTError.connectFailed())
-                        }
-                    }
-                    connTask = nil
-                case .opening:
-                    stopPing()
-                case .closing:
-                    stopPing()
-                }
+            if oldValue == _status { return }
+            Logger.debug("STATUS: \(oldValue) --> \(_status)")
+            defer{
                 notify(status: _status, old: oldValue)
             }
+            switch _status{
+            case .opened:
+                starPing()
+                retrier?.stop()
+            case .opening:
+                stopPing()
+            case .closing:
+                stopPing()
+            case .closed(let reason):
+                socket.stop()
+                stopPing()
+                retrier?.stop()
+                guard let task = self.connTask else{ return }
+                switch reason{
+                case .mqttError(let error):
+                    task.done(with: error)
+                case .otherError(let error):
+                    task.done(with: error)
+                case .networkError(let error):
+                    task.done(with: error)
+                case .clientClose(let code):
+                    task.done(with: MQTTError.clientClose(code))
+                case .serverClose(let code):
+                    task.done(with: MQTTError.serverClose(code))
+                default:
+                    task.done(with:MQTTError.connectFailed())
+                }
+                connTask = nil
+            }
+            
         }
     }
 }
 
 extension MQTTClient{
-    private func closeSocket(){
-        if let socket{
-            socket.cancel()
-            socket.delegate = nil
-            self.socket = nil
-        }
-    }
     /// Internal method run in delegate queue
     /// try close when no need retry
     private func tryClose(reason:CloseReason?){
-        Logger.debug("RETRY: START reason is \(reason == nil ? "nil" : reason!.description)")
         safe.lock(); defer{ safe.unlock() }
         if self.retrying{
             return
         }
+        Logger.debug("RETRY: START reason is \(reason == nil ? "nil" : reason!.description)")
         if case .closed = _status{
             return
         }
@@ -224,17 +221,19 @@ extension MQTTClient{
             return
         }
         // close prev socket and prepare to reconnect
-        self.closeSocket()
+        socket.stop()
         // not clean session when auto reconnection
         if connPacket.cleanSession{
             self.connPacket = connPacket.copyNotClean()
         }
-        self.retrying = true
+        retrying = true
         _status = .opening
         Logger.debug("RETRY: OK! will reconnect after \(delay) seconds")
-        retrier.retry(in: queue,after: delay) {
-            self.connect()
-            self.retrying = false
+        retrier.retry(in: queue,after: delay) {[weak self] in
+            if let self{
+                self.connect()
+                self.retrying = false
+            }
         }
     }
     @discardableResult
@@ -242,9 +241,7 @@ extension MQTTClient{
         guard let packet = self.connPacket else{
             return .init(MQTTError.connectFailed())
         }
-        socket = Socket(endpoint: endpoint,config: config)
-        socket?.delegate = self
-        socket?.start()
+        socket.start()
         return self.sendPacket(packet).then { packet in
             switch packet {
             case let connack as ConnackPacket:
@@ -316,11 +313,11 @@ extension MQTTClient{
     private func starPing(){
         if config.pingEnabled{
             pinging = Pinging(client: self)
-            pinging?.start(in: queue)
+            pinging?.start()
         }
     }
     private func stopPing(){
-        self.pinging?.cancel()
+        self.pinging?.stop()
         self.pingTask?.cancelTimeout()
         self.pingTask = nil
         self.pinging = nil
@@ -333,7 +330,6 @@ extension MQTTClient{
 extension MQTTClient{
     @discardableResult
     private func sendNoWait(_ packet: Packet)->Promise<Void> {
-        guard let socket else { return .init(MQTTError.unconnected) }
         do {
             Logger.debug("SEND: \(packet)")
             pinging?.update()
@@ -347,7 +343,6 @@ extension MQTTClient{
     }
     @discardableResult
     private func sendPacket(_ packet: Packet,timeout:TimeInterval? = nil)->Promise<Packet> {
-        guard let socket else { return .init(MQTTError.unconnected) }
         let task = MQTTTask()
         switch packet.type{
         case .AUTH: /// send `AUTH` is active workflow but packetId is 0
@@ -609,25 +604,27 @@ extension MQTTClient{
     private func processAuth(_ packet: AuthPacket, authflow:@escaping Authflow) -> Promise<Packet> {
         let promise = Promise<Packet>()
         @Sendable func workflow(_ packet: AuthPacket) {
-            authflow(packet.ack()).then{
-                self.sendPacket($0.packet())
-            }.then{
-                switch $0 {
-                case let connack as ConnackPacket:
-                    promise.done(connack)
-                case let auth as AuthPacket:
-                    switch auth.code {
-                    case .continueAuthentication:
-                        workflow(auth)
-                    case .success:
-                        promise.done(auth)
-                    default:
-                        promise.done(MQTTError.decodeError(.unexpectedTokens))
-                    }
-                default:
-                    promise.done(MQTTError.unexpectMessage)
+            authflow(packet.ack())
+                .then{
+                    self.sendPacket($0.packet())
                 }
-            }
+                .then{
+                    switch $0 {
+                    case let connack as ConnackPacket:
+                        promise.done(connack)
+                    case let auth as AuthPacket:
+                        switch auth.code {
+                        case .continueAuthentication:
+                            workflow(auth)
+                        case .success:
+                            promise.done(auth)
+                        default:
+                            promise.done(MQTTError.decodeError(.unexpectedTokens))
+                        }
+                    default:
+                        promise.done(MQTTError.unexpectMessage)
+                    }
+                }
         }
         workflow(packet)
         return promise
@@ -900,30 +897,30 @@ extension MQTTClient{
         }
     }
     func notify(message:Message){
-        self.delegateQueue.async {
+        self.delegateQueue.async {[weak self] in
+            guard let self else { return }
             self.delegate?.mqtt(self, didReceive: message)
-            if let notify = self.notify{
-                let info = ["message":message]
-                notify.post(name: ObserverType.message.notifyName, object: self, userInfo: info)
-            }
+            guard let notify = self.notify else{ return }
+            let info:[String:Message] = ["message":message]
+            notify.post(name: ObserverType.message.notifyName, object: self, userInfo: info)
         }
     }
     func notify(error:Error){
-        self.delegateQueue.async {
+        self.delegateQueue.async {[weak self] in
+            guard let self else { return }
             self.delegate?.mqtt(self, didReceive: error)
-            if let notify = self.notify{
-                let info:[String:Error] = ["error":error]
-                notify.post(name: ObserverType.error.notifyName, object: self, userInfo:info)
-            }
+            guard let notify = self.notify else{ return }
+            let info:[String:Error] = ["error":error]
+            notify.post(name: ObserverType.error.notifyName, object: self, userInfo:info)
         }
     }
     func notify(status:Status,old:Status){
-        self.delegateQueue.async {
-            if let notify = self.notify{
-                let info:[String:Status] = ["old":old,"new":status]
-                notify.post(name: ObserverType.status.notifyName, object: self, userInfo: info)
-            }
+        self.delegateQueue.async {[weak self] in
+            guard let self else { return }
             self.delegate?.mqtt(self, didUpdate: status, prev: old)
+            guard let notify = self.notify else{ return }
+            let info:[String:Status] = ["old":old,"new":status]
+            notify.post(name: ObserverType.status.notifyName, object: self, userInfo: info)
         }
     }
 }
