@@ -12,7 +12,7 @@ protocol SocketDelegate:AnyObject{
     func socket(_ socket:Socket,didReceive error:Error)
     func socket(_ socket:Socket,didReceive packet:Packet)
 }
-class Socket:@unchecked Sendable{
+final class Socket:@unchecked Sendable{
     private let queue = DispatchQueue(label: "mqtt.socket.queue")
     private let config:Config
     private var header:UInt8 = 0
@@ -35,17 +35,21 @@ class Socket:@unchecked Sendable{
         }
     }
     func start(){
-        if let _ = conn?.queue{ return }
-        let params = endpoint.params(config: config)
-        conn = NWConnection.init(to: params.0, using: params.1)
-        conn?.stateUpdateHandler = {[weak self] state in
-            self?.handle(state: state)
-        }
-        conn?.start(queue: queue)
-        if isws{
-            readMessage()
-        }else{
-            readHeader()
+        if self.$conn.write({ conn in
+            if let _ = conn?.queue{ return false }
+            let params = endpoint.params(config: config)
+            conn = NWConnection.init(to: params.0, using: params.1)
+            conn?.stateUpdateHandler = {[weak self] state in
+                self?.handle(state: state)
+            }
+            conn?.start(queue: queue)
+            return true
+        }){
+            if isws{
+                readMessage()
+            }else{
+                readHeader()
+            }
         }
     }
     func send(data:Data)->Promise<Void>{
@@ -65,32 +69,25 @@ class Socket:@unchecked Sendable{
     private func handle(state:NWConnection.State){
         switch state{
         case .cancelled:
-            // This is the network telling us we're closed.
-            // We don't need to actually do anything here
-            // other than check our state is ok.
+            // This is the network telling us we're closed. We don't need to actually do anything here
             break
         case .failed(let error):
             // The connection has failed for some reason.
             self.delegate?.socket(self, didReceive: error)
         case .ready:
+            // Ok connection is ready. But we don't need to do anything at all.
             break
         case .preparing:
             // This just means connections are being actively established. We have no specific action here.
             break
         case .setup:
+            //
             break
-            /// inital state
         case .waiting(let error):
-            // This means the connection cannot currently be completed. We should notify the pipeline
-            // here, or support this with a channel option or something, but for now for the sake of
-            // demos we will just allow ourselves into this stage.tage.
-            // But let's not worry about that right now. so noting happend
-            // In this state we've transitioned into waiting, presumably from active or closing. In this
-            // version of NIO this is an error, but we should aim to support this at some stage.
+            // Perhaps nothing will happen, but here we can safely treat this as an error and there is no harm in doing so.
             self.delegate?.socket(self, didReceive: error)
         default:
-            // This clause is here to help the compiler out: it's otherwise not able to
-            // actually validate that the switch is exhaustive. Trust me, it is.
+            // Never happen
             break
         }
     }
