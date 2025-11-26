@@ -21,6 +21,15 @@ final class Socket:@unchecked Sendable{
     private let endpoint:Endpoint
     @Safely private var conn:NWConnection?
     weak var delegate:SocketDelegate?
+    
+    // 新增：防止重复通知机制
+    private struct ErrorNotification {
+        let errorKey: String
+        let time: Date
+    }
+    @Safely private var lastNotifiedError: ErrorNotification?
+    private let errorDebounceInterval: TimeInterval = 1.0
+    
     init(endpoint:Endpoint,config:Config){
         self.config = config
         self.endpoint = endpoint
@@ -33,6 +42,8 @@ final class Socket:@unchecked Sendable{
             conn?.cancel()
             conn = nil
         }
+        // 重置错误状态
+        self.$lastNotifiedError.write { $0 = nil }
     }
     func start(){
         if self.$conn.write({ conn in
@@ -45,6 +56,9 @@ final class Socket:@unchecked Sendable{
             conn?.start(queue: queue)
             return true
         }){
+            // 重置错误状态
+            self.$lastNotifiedError.write { $0 = nil }
+            
             if isws{
                 readMessage()
             }else{
@@ -53,11 +67,20 @@ final class Socket:@unchecked Sendable{
         }
     }
     func send(data:Data)->Promise<Void>{
-        guard let conn else{ return  Promise(MQTTError.unconnected) }
+        guard let conn else{ 
+            let error = MQTTError.unconnected
+            // 未初始化也是连接错误，通知 delegate
+            notifyDelegateIfConnectionError(error)
+            return Promise(error)
+        }
         let promise = Promise<Void>()
-        conn.send(content: data,contentContext: .mqtt(isws), completion: .contentProcessed({ error in
+        conn.send(content: data,contentContext: .mqtt(isws), completion: .contentProcessed({ [weak self] error in
             if let error{
                 Logger.error("SOCKET SEND: \(data.count) bytes failed. error:\(error)")
+                
+                // 核心修复：检查是否是连接级错误，如果是则通知 delegate 触发重连
+                self?.notifyDelegateIfConnectionError(error)
+                
                 promise.done(error)
             }else{
                 promise.done(())
@@ -70,12 +93,17 @@ final class Socket:@unchecked Sendable{
         switch state{
         case .cancelled:
             // This is the network telling us we're closed. We don't need to actually do anything here
+            // 重置错误状态
+            self.$lastNotifiedError.write { $0 = nil }
             break
         case .failed(let error):
             // The connection has failed for some reason.
-            self.delegate?.socket(self, didReceive: error)
+            // 状态变化错误也通过防重复机制通知
+            notifyDelegateIfConnectionError(error)
         case .ready:
             // Ok connection is ready. But we don't need to do anything at all.
+            // 连接成功，重置错误状态
+            self.$lastNotifiedError.write { $0 = nil }
             break
         case .preparing:
             // This just means connections are being actively established. We have no specific action here.
@@ -85,10 +113,89 @@ final class Socket:@unchecked Sendable{
             break
         case .waiting(let error):
             // Perhaps nothing will happen, but here we can safely treat this as an error and there is no harm in doing so.
-            self.delegate?.socket(self, didReceive: error)
+            // waiting 状态错误也通过防重复机制
+            notifyDelegateIfConnectionError(error)
         default:
-            // Never happen
             break
+        }
+    }
+    
+    // 新增：判断是否是连接级错误（需要触发重连的错误）
+    private func isConnectionError(_ error: Error) -> Bool {
+        // POSIXError 检查
+        if let posixError = error as? POSIXError {
+            switch posixError.code {
+            case .ENOTCONN:      // Socket is not connected ← 核心问题！
+                return true
+            case .EPIPE:         // Broken pipe
+                return true
+            case .ECONNRESET:    // Connection reset by peer
+                return true
+            case .ETIMEDOUT:     // Connection timed out
+                return true
+            case .ENETDOWN:      // Network is down
+                return true
+            case .ENETUNREACH:   // Network is unreachable
+                return true
+            case .EHOSTDOWN:     // Host is down
+                return true
+            case .EHOSTUNREACH:  // No route to host
+                return true
+            case .ECONNABORTED:  // Connection abort
+                return true
+            case .ECONNREFUSED:  // Connection refused
+                return true
+            default:
+                return false
+            }
+        }
+        
+        // NWError 检查
+        if let nwError = error as? NWError {
+            switch nwError {
+            case .posix(let code):
+                return isConnectionError(POSIXError(code))
+            default:
+                return false
+            }
+        }
+        
+        // MQTTError 检查
+        if case MQTTError.unconnected = error {
+            return true
+        }
+        
+        return false
+    }
+    
+    // 新增：防重复通知 + 连接错误检测
+    private func notifyDelegateIfConnectionError(_ error: Error) {
+        // 1. 检查是否是连接级错误
+        guard isConnectionError(error) else {
+            // 不是连接错误，不通知 delegate（让上层通过 Promise 处理）
+            return
+        }
+        
+        // 2. 防重复通知检查
+        let errorKey = "\(type(of: error)).\(error.localizedDescription)"
+        let now = Date()
+        
+        let shouldNotify = self.$lastNotifiedError.write { lastError -> Bool in
+            if let last = lastError {
+                if last.errorKey == errorKey && now.timeIntervalSince(last.time) < errorDebounceInterval {
+                    Logger.debug("SOCKET: Debouncing duplicate connection error")
+                    return false
+                }
+            }
+            // 更新最后通知的错误
+            lastError = ErrorNotification(errorKey: errorKey, time: now)
+            return true
+        }
+        
+        // 3. 通知 delegate
+        if shouldNotify {
+            Logger.warning("SOCKET: Connection error detected, notifying delegate for reconnection")
+            delegate?.socket(self, didReceive: error)
         }
     }
     
@@ -196,6 +303,7 @@ final class Socket:@unchecked Sendable{
         }
     }
 }
+
 extension NWConnection.ContentContext{
     static func mqtt(_ isws:Bool)->NWConnection.ContentContext{
         if isws{
